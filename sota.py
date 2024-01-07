@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
-from pytorch_lightning import LightningModule, Trainer
+import pickle
+import tqdm
 
 
 class FrequencyEmbedding(nn.Module):
@@ -108,8 +109,8 @@ class StateDecoder(nn.Module):
             self.decoder_layer, num_layers=n_layers
         )
 
-        self.last_layer = nn.Linear(d_model, out_dim**2)
-        self.unflatten = nn.Unflatten(-1, (out_dim, out_dim))
+        self.last_layer = nn.Linear(d_model, 2*out_dim**2)
+        self.unflatten = nn.Unflatten(-1, (2, out_dim, out_dim))
 
     def forward(self, src):
         """
@@ -118,8 +119,11 @@ class StateDecoder(nn.Module):
         """
         output = self.transformer_decoder(src)
 
+        output = torch.mean(output, dim=1)  # (batch_size, d_model)
+
         output = self.last_layer(output)
-        output = self.unflatten(output)  # (batch_size, seq_len, out_dim, out_dim)
+
+        output = self.unflatten(output)  # (batch_size, 2, out_dim, out_dim)
 
         return output
 
@@ -155,7 +159,7 @@ class FrequencyDecoder(nn.Module):
         return output
 
 
-class SOTA(LightningModule):
+class SOTA(nn.Module):
     def __init__(self, operator_dim, d_model, nhead, dim_feedforward, dropout, n_layers, activation="relu"):
         super().__init__()
 
@@ -166,63 +170,89 @@ class SOTA(LightningModule):
 
         self.state_loss = nn.MSELoss()
 
-    def forward(self, imperfect_freq, imperfect_operator, masked_operator):
+    def forward(self, imperfect_freqs, imperfect_operators, masked_operators):
         """
-        :param freq: (batch_size, seq_len, 1)
-        :param operator: (batch_size, seq_len, operator_dim, operator_dim), complex matrix
-        :param masked_operator: (batch_size, seq_len1, operator_dim, operator_dim), complex matrix
+        :param imperfect_freqs: (batch_size, seq_len, 1)
+        :param imperfect_operators: (batch_size, seq_len, operator_dim, operator_dim), complex matrix
+        :param masked_operators: (batch_size, seq_len1, operator_dim, operator_dim), complex matrix
         :return: (batch_size, seq_len, operator_dim, operator_dim), complex matrix
         """
-        input_emb = self.input_embedding(imperfect_freq, imperfect_operator)  # (batch_size, seq_len, d_model)
-        masked_operator_emb = self.operator_embedding(masked_operator)  # (batch_size, seq_len1, d_model)
+        input_emb = self.input_embedding(imperfect_freqs, imperfect_operators)  # (batch_size, seq_len, d_model)
+        masked_operators_emb = self.operator_embedding(masked_operators)  # (batch_size, seq_len1, d_model)
 
         state_emb = self.state_encoder(input_emb) # (batch_size, seq_len, d_model)
 
-        state_emb = torch.cat((state_emb, masked_operator_emb), dim=1)  # (batch_size, seq_len+seq_len1, d_model)
+        state_emb = torch.cat((state_emb, masked_operators_emb), dim=1)  # (batch_size, seq_len+seq_len1, d_model)
 
         state = self.state_decoder(state_emb)
 
         return state
 
-    def training_step(self, batch, batch_idx):
-        """
-        :param batch: (imperfect_freq, imperfect_operator, masked_operator, state, proba)
-            imperfect_freq: is the set of frequencies, missing m frequencies
-            imperfect_operator: is the set of operators, missing m frequencies
-            masked_operator: is the set of m missing operators
-            state: is the set of states
-            proba: is the set of probabilities
-        :param batch_idx:
-        :return:
-        """
-        imperfect_freq, imperfect_operator, masked_operator, state, proba = batch
-
-        state_hat = self(imperfect_freq, imperfect_operator, masked_operator)
-
-        loss = self.state_loss(state_hat, state)
-
-        self.log('train_loss', loss)
-        return loss
-
-    def validation_step(self, batch, batch_idx):
-        """
-        :param batch: (freq, operator, state)
-        :param batch_idx:
-        :return:
-        """
-        pass
-
 
 class QSTDataset(torch.utils.data.Dataset):
-    def __init__(self, data):
-        pass
+    def __init__(self):
+        with open("dataset.pkl", "rb") as f:
+            self.dataset = pickle.load(f)
 
     def __len__(self):
-        pass
+        return len(self.dataset)
 
     def __getitem__(self, idx):
-        pass
+        freqs, operators, states, probabilities = self.dataset[idx]
+
+        freqs = torch.tensor(freqs, dtype=torch.float32).unsqueeze(-1)
+        operators = torch.tensor(operators, dtype=torch.complex64)
+        states = torch.tensor(states, dtype=torch.complex64)
+        probabilities = torch.tensor(probabilities, dtype=torch.float32)
+
+        # states from (out_dim, out_dim) to (2, out_dim, out_dim) where first dim is real and second is imaginary
+        states = torch.stack((torch.real(states), torch.imag(states)), dim=0)
+
+        n = 3  # number of missing frequencies
+
+        imperfect_freqs = freqs[:-n]
+        imperfect_operators = operators[:-n]
+        masked_operators = operators[-n:]
+
+        return imperfect_freqs, imperfect_operators, masked_operators, states, probabilities
 
 
-if __name__ == '__main__':
-    pass
+def train():
+    dataset = QSTDataset()
+    train_loader = torch.utils.data.DataLoader(dataset, batch_size=32, shuffle=True)
+
+    device = torch.device(
+        "cuda"
+        if torch.cuda.is_available()
+        else "mps"
+        if torch.backends.mps.is_built()
+        else "cpu",)
+
+    model = SOTA(operator_dim=2, d_model=16, nhead=4, dim_feedforward=64, dropout=0, n_layers=4).to(device)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+    loss_fn = nn.MSELoss()
+
+    for epoch in range(10):
+        pbar = tqdm.tqdm(train_loader)
+        for batch in pbar:
+            imperfect_freqs, imperfect_operators, masked_operators, state, proba = batch
+
+            imperfect_freqs = imperfect_freqs.to(device)
+            imperfect_operators = imperfect_operators.to(device)
+            masked_operators = masked_operators.to(device)
+            state = state.to(device)
+            proba = proba.to(device)
+
+            state_hat = model(imperfect_freqs, imperfect_operators, masked_operators)
+
+            loss = loss_fn(state_hat, state)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            pbar.set_description(f"Epoch {epoch+1} | Loss {loss.item():.4f}")
+
+
+if __name__ == "__main__":
+    train()
